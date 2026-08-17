@@ -1,77 +1,106 @@
-#include <iostream>
-#include <thread>
-#include <vector>
+#pragma once
+
 #include <atomic>
-#include <memory>
-#include <chrono>
+#include <cstddef>
+#include <optional>
+#include <stdexcept>
+#include <utility>
+#include <vector>
 
-
+// Bounded single-producer / single-consumer ring buffer.
+//
+// This keeps the original design:
+//   - fixed-size circular storage
+//   - front/back indices
+//   - one unused slot so front == back means empty
+//   - modulo wrap-around
+//
+// The original header had syntax/type errors and plain int indices. The
+// indices are atomic here so one ingress thread may push while one dispatcher
+// thread pops without a mutex.
 template<typename T>
 class CircularBuffer {
-    private:
-        strcut Node {
-            T data;
-            Node(const& T value) : data(value) {}
-        }:
+private:
+    std::vector<std::optional<T>> buffer_;
+    const std::size_t capacity_; // physical capacity = requested capacity + 1
 
-        std::vector<Node*> buffer;
-        int front;
-        int back;
-        int capacity;
-    
-    public:
-        CircularBuffer(int _capacity) {
+    // Separate cache lines to reduce producer/consumer cache-line contention.
+    alignas(64) std::atomic<std::size_t> front_{0};
+    alignas(64) std::atomic<std::size_t> back_{0};
 
-            if (capacity <= 0) {
-                throw invalid_argument("Invalid capacity");
-            }
+public:
+    explicit CircularBuffer(std::size_t requested_capacity)
+        : buffer_(requested_capacity + 1),
+          capacity_(requested_capacity + 1) {
+        if (requested_capacity == 0) {
+            throw std::invalid_argument("CircularBuffer capacity must be > 0");
+        }
+    }
 
-            this->capacity = _capacity + 1;
-            this->front = 0;
-            this->back = 0;
-            buffer.resize(capacity);
+    CircularBuffer(const CircularBuffer&) = delete;
+    CircularBuffer& operator=(const CircularBuffer&) = delete;
+
+    bool try_push(const T& value) {
+        const std::size_t back = back_.load(std::memory_order_relaxed);
+        const std::size_t next = (back + 1) % capacity_;
+
+        if (next == front_.load(std::memory_order_acquire)) {
+            return false;
         }
 
-        void push_back(Node* val) {
-            if (full()) {
-                throw overflow_error("CircularBuffer is full")
-            }
-            buffer[back] = val;
-            back = (back + 1) % capacity;
+        buffer_[back] = value;
+        back_.store(next, std::memory_order_release);
+        return true;
+    }
+
+    bool try_push(T&& value) {
+        const std::size_t back = back_.load(std::memory_order_relaxed);
+        const std::size_t next = (back + 1) % capacity_;
+
+        if (next == front_.load(std::memory_order_acquire)) {
+            return false;
         }
 
-        void pop_front() {
-            if(empty()) {
-                throw underflow_error("CircularBuffer is empty");
-            }
-            buffer[front] = nullptr;
-            front = (front + 1) % capacity;
+        buffer_[back] = std::move(value);
+        back_.store(next, std::memory_order_release);
+        return true;
+    }
+
+    bool try_pop(T& result) {
+        const std::size_t front = front_.load(std::memory_order_relaxed);
+
+        if (front == back_.load(std::memory_order_acquire)) {
+            return false;
         }
 
-        T getFront() {
-            if(empty()) {
-                throw out_of_range("CircularBuffer is empty");
-            }
-            return buffer[front];
+        result = std::move(*buffer_[front]);
+        buffer_[front].reset();
+        front_.store((front + 1) % capacity_, std::memory_order_release);
+        return true;
+    }
+
+    bool empty() const {
+        return front_.load(std::memory_order_acquire) ==
+               back_.load(std::memory_order_acquire);
+    }
+
+    bool full() const {
+        const std::size_t back = back_.load(std::memory_order_acquire);
+        return ((back + 1) % capacity_) ==
+               front_.load(std::memory_order_acquire);
+    }
+
+    std::size_t size() const {
+        const std::size_t front = front_.load(std::memory_order_acquire);
+        const std::size_t back = back_.load(std::memory_order_acquire);
+
+        if (back >= front) {
+            return back - front;
         }
+        return capacity_ - (front - back);
+    }
 
-        bool empty() const { return front == back; }
-
-        bool full() const { return (back + 1) % capacity == front; }
-
-        int size() const {
-            if (back >= front) {
-                return back - front;
-            }
-            return capacity - (front - back);
-        }
-
-        void printBuffer() const {
-            int index = front;
-            while (index != back) {
-                std::cout << buffer[index] << " ";
-                index = (index + 1) % capacity;
-            }
-            std::cout << endl;
-        }
+    std::size_t capacity() const {
+        return capacity_ - 1;
+    }
 };
